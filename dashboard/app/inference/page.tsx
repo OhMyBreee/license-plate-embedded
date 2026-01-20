@@ -51,7 +51,7 @@ export default function LPRDashboard() {
 
 
   useEffect(() => {
-    esp32IntervalRef.current = setInterval(fetchESP32Frame, 500);
+    esp32IntervalRef.current = setInterval(fetchESP32Frame, 800);
 
     return () => {
       if (esp32IntervalRef.current) {
