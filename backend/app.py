@@ -7,6 +7,7 @@ import requests
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from PIL import Image
 from ultralytics import YOLO
 from fastapi.staticfiles import StaticFiles
@@ -26,8 +27,10 @@ class PlateItem(BaseModel):
 # CONFIG
 # ===========================
 
+status_lock = threading.Lock()
+image_lock = threading.Lock()
+watchlist_lock = threading.Lock()
 BLYNK_TOKEN = "9o8KBxkWAI4nvtVNCgmobSKwKEf14eBF"
-
 VPIN_PLATE = "V0"
 VPIN_MATCH_LED = "V1"
 VPIN_MATCH_STATUS = "V2"
@@ -40,7 +43,11 @@ WATCHLIST = {""}
 # ===========================
 
 plate_detector = YOLO("LPR_MODEL.pt")
+plate_detector.eval()
+plate_detector.fuse()
 char_detector = YOLO("OCR_MODEL.pt")
+char_detector.eval()
+char_detector.fuse()
 
 # ===========================
 # GLOBAL STATUS STATE
@@ -67,7 +74,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-img_queue = queue.Queue(maxsize=2)
+img_queue = queue.Queue(maxsize=1)
 
 # last recog result
 last_status = {
@@ -88,8 +95,8 @@ def refresh_watchlist():
         .from_("watch_list") \
         .select("plate_number") \
         .execute()
-    
-    WATCHLIST = {row["plate_number"].upper() for row in result.data}
+    with watchlist_lock:
+        WATCHLIST = {row["plate_number"].upper() for row in result.data}
 
 # call at startup
 refresh_watchlist()
@@ -98,7 +105,7 @@ refresh_watchlist()
 def auto_refresh_watchlist():
     while True:
         refresh_watchlist()
-        time.sleep(60)
+        time.sleep(2)
 
 threading.Thread(target=auto_refresh_watchlist, daemon=True).start()
 
@@ -140,7 +147,7 @@ latest_image_path = "saved_images/latest.jpg"
 
 @app.post("/recognize")
 async def recognize(request: Request):
-
+    print(">>> ENTER recognize")
     img_bytes = await request.body()
     if not img_bytes:
         return {"status": "error", "msg": "no data"}
@@ -150,65 +157,92 @@ async def recognize(request: Request):
     img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
     # save latest image
-    cv2.imwrite(latest_image_path, img)
+    with image_lock:
+        cv2.imwrite(latest_image_path, img)
 
     # push to YOLO queue, drop old frames
     if img_queue.full():
         img_queue.get()
     img_queue.put(img)
-
     return {"status": "ok"}
+
 
 def yolo_worker():
     global last_status
 
     while True:
-        img = img_queue.get()  # waits for frame
+        try:
+            img = img_queue.get()  # waits for frame
+            print(">>> BEFORE inference plate")
+            results = plate_detector(img, conf=0.1, verbose=False)
+            boxes = results[0].boxes
 
-        results = plate_detector(img, conf=0.2, verbose=False)
-        boxes = results[0].boxes
+            print(">>> AFTER inference plate")
+            if not boxes:
+                with status_lock:
+                    last_status = {
+                        "plate": "NO PLATE",
+                        "match": False,
+                        "updated": True
+                    }
+                send_to_blynk("NO PLATE", False) 
+                continue
 
-        if not boxes:
+            # pick biggest or most chars
+            best = None
+            best_len = 0
+            h, w = img.shape[:2]
+
+
+            for box in boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(w, x2)
+                y2 = min(h, y2)
+                crop = img[y1:y2, x1:x2]
+
+                ocr = char_detector(crop, conf=0.14, verbose=False)
+
+                chars = sorted(
+                    (
+                        (int(c.xyxy[0][0]), "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[int(c.cls[0])])
+                        for c in ocr[0].boxes
+                    ),
+                    key=lambda x: x[0]
+                )
+
+                plate_txt = "".join(c for _, c in chars)
+
+                if len(plate_txt) > best_len:
+                    best = plate_txt
+                    best_len = len(plate_txt)
+
+
+            if not best:
+                with status_lock:
+                    last_status = {
+                        "plate": "---",
+                        "match": False,
+                        "updated": True
+                    }
+                send_to_blynk("---", False)
+                continue
+            is_match = best.upper() in WATCHLIST
+
             last_status = {
-                "plate": "NO PLATE",
-                "match": False,
-                "updated": True
+                    "plate": best,
+                    "match": is_match,
+                    "updated": True
             }
-            send_to_blynk("NO PLATE", False) 
-            continue
+            print("Boxes:", len(results[0].boxes))
+            print("Conf:", [float(c) for c in results[0].boxes.conf])
 
-        # pick biggest or most chars
-        best = None
-        best_len = 0
+            send_to_blynk(last_status["plate"], is_match)
+            # cv2.imwrite(f"debug_crop_{time.time()}.jpg", crop)
+        except Exception as e:
+            print("🔥 YOLO WORKER ERROR:", e)
 
-        for box in boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            crop = img[y1:y2, x1:x2]
-
-            ocr = char_detector(crop, conf=0.25, verbose=False)
-
-            chars = sorted(
-                (
-                    (int(c.xyxy[0][0]), "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[int(c.cls[0])])
-                    for c in ocr[0].boxes
-                ),
-                key=lambda x: x[0]
-            )
-
-            plate_txt = "".join(c for _, c in chars)
-
-            if len(plate_txt) > best_len:
-                best = plate_txt
-                best_len = len(plate_txt)
-
-        is_match = best.upper() in WATCHLIST
-
-        last_status = {
-            "plate": best if best else "---",
-            "match": is_match,
-            "updated": True
-        }
-        send_to_blynk(last_status["plate"], is_match)
 
 threading.Thread(target=yolo_worker, daemon=True).start()
 
@@ -222,19 +256,21 @@ def status_json():
     This endpoint returns the most recent recognition result.
     ESP32 will poll this every few seconds.
     """
-    return {
-        "plate": last_status.get("plate", "---"),
-        # "plate": "A1721FQ",
-        "match": last_status.get("match", False)
-    }
+    with status_lock:
+        return {
+            "plate": last_status.get("plate", "---"),
+            # "plate": "A1721FQ",
+            "match": last_status.get("match", False)
+        }
 
-@app.get("/status/json")
-def status_json():
-    return last_status
 
 @app.get("/latest")
 def get_latest_image():
-    return FileResponse("saved_images/latest.jpg")
+    with image_lock:
+        print(">>> BEFORE RETURN IMAGE")
+        if not os.path.exists(latest_image_path):
+            raise HTTPException(status_code=404)
+        return FileResponse(latest_image_path, media_type="image/jpeg")
 
 
 
