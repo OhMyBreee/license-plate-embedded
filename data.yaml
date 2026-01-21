@@ -1,0 +1,18 @@
+# Define the path to the dataset root folder
+# This path is relative to the location of the data.yaml file itself.
+# path: ./Indonesian License Plate Dataset 
+
+# Define the relative paths from the 'path' root to the image folders
+# YOLOv8 expects images to be split into train/val/test
+# Assuming all your data is together, you should split it first.
+# For simplicity, we'll assume a single folder for now:
+
+train: ../data/processed/images/train
+val: ../data/processed/images/val
+test: ../data/processed/images/test
+
+# Number of classes
+nc: 1
+
+# Class names in order (replace 'plate' if you have specific classes)
+names: ['license_plate']
